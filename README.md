@@ -50,6 +50,68 @@ Metrics are published every 60 seconds by default. You can adjust this with the 
 Sidekiq::CloudWatchMetrics.enable!(interval: 30)
 ```
 
+When the interval is less than 60 seconds the metrics are published as
+[high-resolution metrics][highres] (1-second storage resolution), suitable for
+fast-reacting alarms and burst auto-scaling.
+
+  [highres]: https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/publishingMetrics.html#high-resolution-metrics
+
+### Choosing which metrics to publish
+
+By default every metric is published. To opt in to a subset, pass a `metrics:`
+array of symbols:
+
+```ruby
+# Just publish queue depth + latency, useful for autoscaling alarms
+Sidekiq::CloudWatchMetrics.enable!(
+  interval: 10,
+  metrics: %i[queue_size queue_latency],
+)
+```
+
+The publisher skips the upstream Sidekiq calls it doesn't need — e.g. if you
+only ask for queue metrics it won't enumerate the process set, and if you only
+ask for global stats it won't iterate queues.
+
+`enable!` may be called multiple times to register additional publishers with
+different cadences and filters. For example, a slow full-fat publisher plus a
+fast queue-only publisher for burst scaling:
+
+```ruby
+Sidekiq::CloudWatchMetrics.enable!  # everything, every 60s
+Sidekiq::CloudWatchMetrics.enable!(
+  interval: 10,
+  metrics: %i[queue_size queue_latency],
+)
+```
+
+Available metric keys:
+
+| Symbol                  | CloudWatch metric     | Scope                                  |
+| ----------------------- | --------------------- | -------------------------------------- |
+| `:processed_jobs`       | `ProcessedJobs`       | global                                 |
+| `:failed_jobs`          | `FailedJobs`          | global                                 |
+| `:enqueued_jobs`        | `EnqueuedJobs`        | global                                 |
+| `:scheduled_jobs`       | `ScheduledJobs`       | global                                 |
+| `:retry_jobs`           | `RetryJobs`           | global                                 |
+| `:dead_jobs`            | `DeadJobs`            | global                                 |
+| `:workers`              | `Workers`             | global                                 |
+| `:processes`            | `Processes`           | global                                 |
+| `:default_queue_latency`| `DefaultQueueLatency` | global                                 |
+| `:capacity`             | `Capacity`            | global aggregate over all processes    |
+| `:utilization`          | `Utilization`         | global aggregate over all processes    |
+| `:tag_capacity`         | `Capacity`            | per process tag                        |
+| `:tag_utilization`      | `Utilization`         | per process tag                        |
+| `:process_utilization`  | `Utilization`         | per process (Hostname dimension)       |
+| `:queue_size`           | `QueueSize`           | per queue                              |
+| `:queue_latency`        | `QueueLatency`        | per queue                              |
+
+Unknown symbols raise `ArgumentError` at boot.
+
+The legacy `process_metrics:` boolean is still accepted for backwards
+compatibility but emits a deprecation warning — prefer the `metrics:` option
+(omit `:process_utilization` to disable per-process utilization).
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake spec` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.

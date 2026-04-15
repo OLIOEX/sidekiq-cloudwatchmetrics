@@ -45,6 +45,33 @@ module Sidekiq::CloudWatchMetrics
 
     DEFAULT_INTERVAL = 60 # seconds
 
+    # Metric keys grouped by the upstream Sidekiq data they need, so the
+    # publisher can skip work it doesn't have to do on each tick.
+    GLOBAL_STATS_METRICS = %i[
+      processed_jobs
+      failed_jobs
+      enqueued_jobs
+      scheduled_jobs
+      retry_jobs
+      dead_jobs
+      workers
+      processes
+      default_queue_latency
+    ].freeze
+
+    GLOBAL_AGGREGATE_METRICS = %i[capacity utilization].freeze
+    TAG_METRICS = %i[tag_capacity tag_utilization].freeze
+    PROCESS_METRICS = %i[process_utilization].freeze
+    QUEUE_METRICS = %i[queue_size queue_latency].freeze
+
+    ALL_METRICS = (
+      GLOBAL_STATS_METRICS +
+      GLOBAL_AGGREGATE_METRICS +
+      TAG_METRICS +
+      PROCESS_METRICS +
+      QUEUE_METRICS
+    ).freeze
+
     private def default_config
       # Sidekiq::Config was introduced in sidekiq 7 and has a default
       if Sidekiq.respond_to?(:default_configuration)
@@ -55,15 +82,16 @@ module Sidekiq::CloudWatchMetrics
       end
     end
 
-    def initialize(config: default_config, client: Aws::CloudWatch::Client.new, namespace: "Sidekiq", process_metrics: true, additional_dimensions: {}, interval: DEFAULT_INTERVAL)
+    def initialize(config: default_config, client: Aws::CloudWatch::Client.new, namespace: "Sidekiq", process_metrics: nil, additional_dimensions: {}, interval: DEFAULT_INTERVAL, metrics: nil)
       # Required by Sidekiq::Component (in sidekiq 6.5+)
       @config = config
 
       @client = client
       @interval_s = interval
       @namespace = namespace
-      @process_metrics = process_metrics
       @additional_dimensions = additional_dimensions.map { |k, v| {name: k.to_s, value: v.to_s} }
+
+      @enabled_metrics = resolve_enabled_metrics(metrics, process_metrics)
     end
 
     def start
@@ -102,170 +130,148 @@ module Sidekiq::CloudWatchMetrics
 
     def publish
       now = Time.now
-      stats = Sidekiq::Stats.new
-      processes = Sidekiq::ProcessSet.new.to_enum(:each).to_a
-      queues = stats.queues
+      metrics = []
 
-      metrics = [
-        {
-          metric_name: "ProcessedJobs",
-          timestamp: now,
-          value: stats.processed,
-          unit: "Count",
-        },
-        {
-          metric_name: "FailedJobs",
-          timestamp: now,
-          value: stats.failed,
-          unit: "Count",
-        },
-        {
-          metric_name: "EnqueuedJobs",
-          timestamp: now,
-          value: stats.enqueued,
-          unit: "Count",
-        },
-        {
-          metric_name: "ScheduledJobs",
-          timestamp: now,
-          value: stats.scheduled_size,
-          unit: "Count",
-        },
-        {
-          metric_name: "RetryJobs",
-          timestamp: now,
-          value: stats.retry_size,
-          unit: "Count",
-        },
-        {
-          metric_name: "DeadJobs",
-          timestamp: now,
-          value: stats.dead_size,
-          unit: "Count",
-        },
-        {
-          metric_name: "Workers",
-          timestamp: now,
-          value: stats.workers_size,
-          unit: "Count",
-        },
-        {
-          metric_name: "Processes",
-          timestamp: now,
-          value: stats.processes_size,
-          unit: "Count",
-        },
-        {
-          metric_name: "DefaultQueueLatency",
-          timestamp: now,
-          value: stats.default_queue_latency,
-          unit: "Seconds",
-        },
-        {
-          metric_name: "Capacity",
-          timestamp: now,
-          value: calculate_capacity(processes),
-          unit: "Count",
-        },
-      ]
+      needs_stats = enabled_any?(GLOBAL_STATS_METRICS)
+      needs_processes = enabled_any?(GLOBAL_AGGREGATE_METRICS + TAG_METRICS + PROCESS_METRICS)
+      needs_queues = enabled_any?(QUEUE_METRICS)
 
-      utilization = calculate_utilization(processes) * 100.0
+      # Sidekiq::Stats already fetches queue names and sizes on init, so reuse
+      # it when we need either global stats or per-queue metrics.
+      stats = Sidekiq::Stats.new if needs_stats || needs_queues
+      processes = needs_processes ? Sidekiq::ProcessSet.new.to_enum(:each).to_a : []
 
-      unless utilization.nan?
-        metrics << {
-          metric_name: "Utilization",
-          timestamp: now,
-          value: utilization,
-          unit: "Percent",
-        }
+      if needs_stats
+        metrics << build_metric("ProcessedJobs", stats.processed, now) if enabled?(:processed_jobs)
+        metrics << build_metric("FailedJobs", stats.failed, now) if enabled?(:failed_jobs)
+        metrics << build_metric("EnqueuedJobs", stats.enqueued, now) if enabled?(:enqueued_jobs)
+        metrics << build_metric("ScheduledJobs", stats.scheduled_size, now) if enabled?(:scheduled_jobs)
+        metrics << build_metric("RetryJobs", stats.retry_size, now) if enabled?(:retry_jobs)
+        metrics << build_metric("DeadJobs", stats.dead_size, now) if enabled?(:dead_jobs)
+        metrics << build_metric("Workers", stats.workers_size, now) if enabled?(:workers)
+        metrics << build_metric("Processes", stats.processes_size, now) if enabled?(:processes)
+        metrics << build_metric("DefaultQueueLatency", stats.default_queue_latency, now, unit: "Seconds") if enabled?(:default_queue_latency)
       end
 
-      processes.group_by do |process|
-        process["tag"]
-      end.each do |(tag, tag_processes)|
-        next if tag.nil?
+      if enabled?(:capacity)
+        metrics << build_metric("Capacity", calculate_capacity(processes), now)
+      end
 
-        tag_dimensions = [{name: "Tag", value: tag}]
-
-        metrics << {
-          metric_name: "Capacity",
-          dimensions: tag_dimensions,
-          timestamp: now,
-          value: calculate_capacity(tag_processes),
-          unit: "Count",
-        }
-
-        tag_utilization = calculate_utilization(tag_processes) * 100.0
-
-        unless tag_utilization.nan?
-          metrics << {
-            metric_name: "Utilization",
-            dimensions: tag_dimensions,
-            timestamp: now,
-            value: tag_utilization,
-            unit: "Percent",
-          }
+      if enabled?(:utilization)
+        utilization = calculate_utilization(processes) * 100.0
+        unless utilization.nan?
+          metrics << build_metric("Utilization", utilization, now, unit: "Percent")
         end
       end
 
-      if @process_metrics
-        processes.each do |process|
-          process_utilization = process["busy"] / process["concurrency"].to_f * 100.0
+      if enabled_any?(TAG_METRICS)
+        processes.group_by { |process| process["tag"] }.each do |(tag, tag_processes)|
+          next if tag.nil?
 
-          unless process_utilization.nan?
-            process_dimensions = [{name: "Hostname", value: process["hostname"]}]
+          tag_dimensions = [{name: "Tag", value: tag}]
 
-            if process["tag"] && !process["tag"].to_s.empty?
-              process_dimensions << {name: "Tag", value: process["tag"]}
+          if enabled?(:tag_capacity)
+            metrics << build_metric("Capacity", calculate_capacity(tag_processes), now, dimensions: tag_dimensions)
+          end
+
+          if enabled?(:tag_utilization)
+            tag_utilization = calculate_utilization(tag_processes) * 100.0
+
+            unless tag_utilization.nan?
+              metrics << build_metric("Utilization", tag_utilization, now, unit: "Percent", dimensions: tag_dimensions)
             end
-
-            metrics << {
-              metric_name: "Utilization",
-              dimensions: process_dimensions,
-              timestamp: now,
-              value: process_utilization,
-              unit: "Percent",
-            }
           end
         end
       end
 
-      queues.each do |(queue_name, queue_size)|
-        metrics << {
-          metric_name: "QueueSize",
-          dimensions: [{name: "QueueName", value: queue_name}],
-          timestamp: now,
-          value: queue_size,
-          unit: "Count",
-        }
+      if enabled?(:process_utilization)
+        processes.each do |process|
+          process_utilization = process["busy"] / process["concurrency"].to_f * 100.0
 
-        queue_latency = Sidekiq::Queue.new(queue_name).latency
+          next if process_utilization.nan?
 
-        metrics << {
-          metric_name: "QueueLatency",
-          dimensions: [{name: "QueueName", value: queue_name}],
-          timestamp: now,
-          value: queue_latency,
-          unit: "Seconds",
-        }
+          process_dimensions = [{name: "Hostname", value: process["hostname"]}]
+
+          if process["tag"] && !process["tag"].to_s.empty?
+            process_dimensions << {name: "Tag", value: process["tag"]}
+          end
+
+          metrics << build_metric("Utilization", process_utilization, now, unit: "Percent", dimensions: process_dimensions)
+        end
+      end
+
+      if needs_queues
+        stats.queues.each do |(queue_name, queue_size)|
+          queue_dimensions = [{name: "QueueName", value: queue_name}]
+
+          if enabled?(:queue_size)
+            metrics << build_metric("QueueSize", queue_size, now, dimensions: queue_dimensions)
+          end
+
+          if enabled?(:queue_latency)
+            queue_latency = Sidekiq::Queue.new(queue_name).latency
+            metrics << build_metric("QueueLatency", queue_latency, now, unit: "Seconds", dimensions: queue_dimensions)
+          end
+        end
       end
 
       unless @additional_dimensions.empty?
-        metrics = metrics.each do |metric|
+        metrics.each do |metric|
           metric[:dimensions] = (metric[:dimensions] || []) + @additional_dimensions
         end
       end
 
+      if @interval_s < 60
+        metrics.each { |metric| metric[:storage_resolution] = 1 }
+      end
+
       # We can only put 20 metrics at a time
       metrics.each_slice(20) do |some_metrics|
-        if @interval_s < 60
-          metrics.each { |metric| metric.merge!(storage_resolution: 1) }
-        end
         @client.put_metric_data(
           namespace: @namespace,
           metric_data: some_metrics,
         )
       end
+    end
+
+    private def build_metric(name, value, timestamp, unit: "Count", dimensions: nil)
+      metric = {
+        metric_name: name,
+        timestamp: timestamp,
+        value: value,
+        unit: unit,
+      }
+      metric[:dimensions] = dimensions if dimensions
+      metric
+    end
+
+    private def enabled?(key)
+      @enabled_metrics.include?(key)
+    end
+
+    private def enabled_any?(keys)
+      (@enabled_metrics & keys).any?
+    end
+
+    private def resolve_enabled_metrics(metrics, process_metrics)
+      enabled =
+        if metrics.nil?
+          ALL_METRICS.dup
+        else
+          requested = Array(metrics).map(&:to_sym)
+          unknown = requested - ALL_METRICS
+          if unknown.any?
+            raise ArgumentError, "Unknown metric#{"s" if unknown.size > 1}: #{unknown.inspect}. Available: #{ALL_METRICS.inspect}"
+          end
+          requested
+        end
+
+      unless process_metrics.nil?
+        warn "[sidekiq-cloudwatchmetrics] `process_metrics:` is deprecated; use `metrics:` to choose which metrics to publish (omit `:process_utilization` to disable per-process utilization)."
+        enabled -= [:process_utilization] unless process_metrics
+      end
+
+      enabled
     end
 
     # Returns the total number of workers across all processes

@@ -533,7 +533,16 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
       end
 
       context "when per process metrics are disabled" do
-        subject(:publisher) { Sidekiq::CloudWatchMetrics::Publisher.new(client: client, process_metrics: false) }
+        subject(:publisher) do
+          # Silence the deprecation warning emitted at init time
+          original_stderr = $stderr
+          $stderr = StringIO.new
+          begin
+            Sidekiq::CloudWatchMetrics::Publisher.new(client: client, process_metrics: false)
+          ensure
+            $stderr = original_stderr
+          end
+        end
 
         it "only publishes a single Utilization metric" do
           Timecop.freeze(now = Time.now) do
@@ -551,6 +560,113 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
                 },
               )
             }
+          end
+        end
+
+        it "emits a deprecation warning" do
+          expect {
+            Sidekiq::CloudWatchMetrics::Publisher.new(client: client, process_metrics: false)
+          }.to output(/`process_metrics:` is deprecated/).to_stderr
+        end
+      end
+
+      context "with a metrics filter" do
+        context "selecting only a single global metric" do
+          subject(:publisher) { Sidekiq::CloudWatchMetrics::Publisher.new(client: client, metrics: [:retry_jobs]) }
+
+          it "publishes only that metric" do
+            Timecop.freeze(now = Time.now) do
+              publisher.publish
+
+              expect(client).to have_received(:put_metric_data).with(
+                namespace: "Sidekiq",
+                metric_data: [
+                  {
+                    metric_name: "RetryJobs",
+                    timestamp: now,
+                    value: 2,
+                    unit: "Count",
+                  },
+                ],
+              )
+            end
+          end
+
+          it "does not enumerate processes or queues" do
+            expect(Sidekiq::ProcessSet).not_to receive(:new)
+            expect(Sidekiq::Queue).not_to receive(:new)
+            publisher.publish
+          end
+        end
+
+        context "selecting only queue metrics" do
+          subject(:publisher) do
+            Sidekiq::CloudWatchMetrics::Publisher.new(client: client, metrics: %i[queue_size queue_latency])
+          end
+
+          it "publishes only the queue metrics, with high-resolution storage when interval < 60" do
+            publisher_with_short_interval = Sidekiq::CloudWatchMetrics::Publisher.new(
+              client: client, metrics: %i[queue_size queue_latency], interval: 10
+            )
+
+            Timecop.freeze(now = Time.now) do
+              publisher_with_short_interval.publish
+
+              expect(client).to have_received(:put_metric_data).with(
+                namespace: "Sidekiq",
+                metric_data: contain_exactly(
+                  {metric_name: "QueueSize", dimensions: [{name: "QueueName", value: "foo"}], timestamp: now, value: 1, unit: "Count", storage_resolution: 1},
+                  {metric_name: "QueueLatency", dimensions: [{name: "QueueName", value: "foo"}], timestamp: now, value: 1.23, unit: "Seconds", storage_resolution: 1},
+                  {metric_name: "QueueSize", dimensions: [{name: "QueueName", value: "bar"}], timestamp: now, value: 2, unit: "Count", storage_resolution: 1},
+                  {metric_name: "QueueLatency", dimensions: [{name: "QueueName", value: "bar"}], timestamp: now, value: 1.23, unit: "Seconds", storage_resolution: 1},
+                ),
+              )
+            end
+          end
+
+          it "does not enumerate processes" do
+            expect(Sidekiq::ProcessSet).not_to receive(:new)
+            publisher.publish
+          end
+        end
+
+        context "selecting only process_utilization" do
+          subject(:publisher) { Sidekiq::CloudWatchMetrics::Publisher.new(client: client, metrics: [:process_utilization]) }
+
+          it "does not call Sidekiq::Stats" do
+            expect(Sidekiq::Stats).not_to receive(:new)
+            publisher.publish
+          end
+
+          it "publishes only the per-process utilization metrics" do
+            Timecop.freeze(now = Time.now) do
+              publisher.publish
+
+              expect(client).to have_received(:put_metric_data).with(
+                namespace: "Sidekiq",
+                metric_data: contain_exactly(
+                  {metric_name: "Utilization", dimensions: [{name: "Hostname", value: "foo"}], timestamp: now, value: 50.0, unit: "Percent"},
+                  {metric_name: "Utilization", dimensions: [{name: "Hostname", value: "bar"}], timestamp: now, value: 10.0, unit: "Percent"},
+                ),
+              )
+            end
+          end
+        end
+
+        context "with an unknown metric" do
+          it "raises ArgumentError at init" do
+            expect {
+              Sidekiq::CloudWatchMetrics::Publisher.new(client: client, metrics: [:not_a_real_metric])
+            }.to raise_error(ArgumentError, /Unknown metric.*:not_a_real_metric/)
+          end
+        end
+
+        context "with an empty metrics array" do
+          subject(:publisher) { Sidekiq::CloudWatchMetrics::Publisher.new(client: client, metrics: []) }
+
+          it "publishes nothing" do
+            publisher.publish
+            expect(client).not_to have_received(:put_metric_data)
           end
         end
       end
