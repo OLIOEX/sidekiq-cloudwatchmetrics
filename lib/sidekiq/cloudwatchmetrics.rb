@@ -1,11 +1,63 @@
 # frozen_string_literal: true
 
+require "securerandom"
+require "socket"
+
 require "sidekiq"
 require "sidekiq/api"
 
 require "aws-sdk-cloudwatch"
 
 module Sidekiq::CloudWatchMetrics
+  # Cluster-wide leader election backed by a Redis SETNX-with-TTL lock, for
+  # OSS Sidekiq deployments that want a single publisher across N nodes (the
+  # default behaviour is to publish from every node, which CloudWatch handles
+  # fine but costs N× the put_metric_data API calls).
+  #
+  # Election is re-checked on every publish tick. If the holder dies, any
+  # other node picks up the lock at the next tick — failover takes at most
+  # one interval. On clean shutdown the lock is released so failover is
+  # instantaneous.
+  class RedisLeader
+    DEFAULT_TTL_MULTIPLIER = 3
+
+    def initialize(key:, interval:, ttl: nil, id: nil)
+      @key = key
+      @ttl = ttl || (interval * DEFAULT_TTL_MULTIPLIER)
+      @id = id || "#{Socket.gethostname}-#{Process.pid}-#{SecureRandom.hex(4)}"
+    end
+
+    attr_reader :id, :key, :ttl
+
+    # Returns true if this process now holds the lock (either freshly
+    # acquired or extended). The set..ex..nx command is atomic in Redis 2.6+;
+    # the read-then-extend on the else branch races at most by one TTL, which
+    # for our purpose is harmless (publishes are idempotent).
+    def acquire_or_extend
+      Sidekiq.redis do |conn|
+        return true if conn.set(@key, @id, nx: true, ex: @ttl)
+
+        current = conn.get(@key)
+        if current == @id
+          conn.expire(@key, @ttl)
+          true
+        else
+          false
+        end
+      end
+    end
+
+    # Best-effort release on shutdown. If the lock has already expired and
+    # someone else holds it, we leave it alone.
+    def release
+      Sidekiq.redis do |conn|
+        conn.del(@key) if conn.get(@key) == @id
+      end
+    rescue => e
+      Sidekiq.logger.debug { "RedisLeader release failed: #{e}" } if Sidekiq.respond_to?(:logger)
+    end
+  end
+
   def self.enable!(**kwargs)
     Sidekiq.configure_server do |config|
       publisher = Publisher.new(config: config, **kwargs)
@@ -97,7 +149,7 @@ module Sidekiq::CloudWatchMetrics
       end
     end
 
-    def initialize(config: default_config, client: Aws::CloudWatch::Client.new, namespace: "Sidekiq", process_metrics: nil, additional_dimensions: {}, interval: DEFAULT_INTERVAL, metrics: nil)
+    def initialize(config: default_config, client: Aws::CloudWatch::Client.new, namespace: "Sidekiq", process_metrics: nil, additional_dimensions: {}, interval: DEFAULT_INTERVAL, metrics: nil, leader_election: nil)
       # Required by Sidekiq::Component (in sidekiq 6.5+)
       @config = config
 
@@ -107,6 +159,7 @@ module Sidekiq::CloudWatchMetrics
       @additional_dimensions = additional_dimensions.map { |k, v| {name: k.to_s, value: v.to_s} }
 
       @enabled_metrics = resolve_enabled_metrics(metrics, process_metrics)
+      @leader = build_leader(leader_election)
     end
 
     def start
@@ -144,6 +197,8 @@ module Sidekiq::CloudWatchMetrics
     end
 
     def publish
+      return unless leader?
+
       now = Time.now
       metrics = []
 
@@ -281,6 +336,31 @@ module Sidekiq::CloudWatchMetrics
       (@enabled_metrics & keys).any?
     end
 
+    # When leader_election is configured, only the lock holder publishes on
+    # each tick. Every node still runs the publisher thread so that failover
+    # is automatic: the next node to acquire the lock starts publishing at
+    # its next tick, no restart required.
+    private def leader?
+      return true if @leader.nil?
+      @leader.acquire_or_extend
+    end
+
+    private def build_leader(leader_election)
+      case leader_election
+      when nil, false
+        nil
+      when :redis
+        RedisLeader.new(key: "sidekiq-cloudwatchmetrics:leader:#{@namespace}", interval: @interval_s)
+      else
+        # Accept any object that quacks like a leader so callers can plug in
+        # their own elector (a different backend, a test double, etc.).
+        unless leader_election.respond_to?(:acquire_or_extend) && leader_election.respond_to?(:release)
+          raise ArgumentError, "Unknown leader_election option: #{leader_election.inspect}. Expected :redis, nil, or an object responding to #acquire_or_extend and #release."
+        end
+        leader_election
+      end
+    end
+
     private def resolve_enabled_metrics(metrics, process_metrics)
       enabled =
         if metrics.nil?
@@ -383,6 +463,8 @@ module Sidekiq::CloudWatchMetrics
     rescue ThreadError
       # Don't raise if thread is already dead.
       nil
+    ensure
+      @leader&.release
     end
   end
 end

@@ -125,6 +125,47 @@ The legacy `process_metrics:` boolean is still accepted for backwards
 compatibility but emits a deprecation warning — prefer the `metrics:` option
 (omit `:process_utilization` to disable per-process utilization).
 
+### Leader election (single-publisher across N nodes)
+
+On Sidekiq Enterprise the publisher already runs on a single leader process
+(via `config.on(:leader)`). On OSS Sidekiq the default is that every node
+publishes — CloudWatch dedupes datapoints to the same metric per second so
+your dashboards stay correct, but you pay N× the `put_metric_data` API
+calls and the `SampleCount` of each datapoint becomes N instead of 1.
+
+To elect a single publisher across all your OSS Sidekiq nodes, opt in to
+the Redis-backed leader election:
+
+```ruby
+Sidekiq::CloudWatchMetrics.enable!(
+  leader_election: :redis,
+)
+```
+
+How it works: every node still starts the publisher thread, but inside
+each tick it tries to acquire (or extend) a Redis `SET key value NX EX`
+lock. Only the lock holder actually calls `put_metric_data`. The lock key
+is scoped by `namespace:` so multiple deployments sharing a Redis don't
+fight over the same lock. TTL defaults to 3× your publish interval. On
+clean shutdown the lock is released so failover is instant; on a crash
+the lock expires naturally and any other node picks up at its next tick.
+
+Use this **only** on the standard cadence publisher. Don't enable it on a
+fast burst publisher (e.g. 10s for `queue_size`/`queue_latency` driving
+auto-scaling) — there you want every node to keep refreshing the values
+even if the leader hangs.
+
+```ruby
+# Standard publisher: single leader, low API churn
+Sidekiq::CloudWatchMetrics.enable!(leader_election: :redis)
+
+# Burst publisher: every node, no leader, fast failover
+Sidekiq::CloudWatchMetrics.enable!(
+  interval: 10,
+  metrics: %i[queue_size queue_latency],
+)
+```
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake spec` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.

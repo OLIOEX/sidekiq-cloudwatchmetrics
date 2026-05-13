@@ -795,6 +795,62 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
           end
         end
       end
+
+      context "with leader_election" do
+        let(:leader_acquired) { true }
+        let(:leader) do
+          instance_double(Sidekiq::CloudWatchMetrics::RedisLeader, acquire_or_extend: leader_acquired, release: nil)
+        end
+        subject(:publisher) do
+          Sidekiq::CloudWatchMetrics::Publisher.new(client: client, leader_election: leader)
+        end
+
+        context "when this process holds the leader lock" do
+          let(:leader_acquired) { true }
+
+          it "publishes as normal" do
+            publisher.publish
+            expect(client).to have_received(:put_metric_data)
+          end
+        end
+
+        context "when another process holds the leader lock" do
+          let(:leader_acquired) { false }
+
+          it "skips publishing entirely" do
+            publisher.publish
+            expect(client).not_to have_received(:put_metric_data)
+          end
+
+          it "does not enumerate stats, processes, or queues" do
+            expect(Sidekiq::Stats).not_to receive(:new)
+            expect(Sidekiq::ProcessSet).not_to receive(:new)
+            expect(Sidekiq::Queue).not_to receive(:new)
+            publisher.publish
+          end
+        end
+
+        context "with leader_election: :redis" do
+          it "builds a RedisLeader scoped by namespace" do
+            expect(Sidekiq::CloudWatchMetrics::RedisLeader).to receive(:new).with(
+              key: "sidekiq-cloudwatchmetrics:leader:my-ns",
+              interval: 60,
+            ).and_return(leader)
+
+            Sidekiq::CloudWatchMetrics::Publisher.new(
+              client: client, namespace: "my-ns", leader_election: :redis,
+            )
+          end
+        end
+
+        context "with an unknown leader_election value" do
+          it "raises ArgumentError at init" do
+            expect {
+              Sidekiq::CloudWatchMetrics::Publisher.new(client: client, leader_election: :etcd)
+            }.to raise_error(ArgumentError, /Unknown leader_election option: :etcd/)
+          end
+        end
+      end
     end
 
     describe "#stop" do
@@ -806,6 +862,82 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
         expect do
           publisher.stop
         end.not_to raise_error
+      end
+
+      it "releases the leader lock when configured" do
+        leader = instance_double(Sidekiq::CloudWatchMetrics::RedisLeader, acquire_or_extend: true)
+        expect(leader).to receive(:release)
+        publisher = Sidekiq::CloudWatchMetrics::Publisher.new(client: client, leader_election: leader)
+        publisher.stop
+      end
+    end
+  end
+
+  describe Sidekiq::CloudWatchMetrics::RedisLeader do
+    let(:conn) { double(:redis_conn) }
+
+    subject(:leader) { described_class.new(key: "test-lock", interval: 60, id: "node-a") }
+
+    before { allow(Sidekiq).to receive(:redis).and_yield(conn) }
+
+    describe "#acquire_or_extend" do
+      it "acquires when the lock is free" do
+        expect(conn).to receive(:set).with("test-lock", "node-a", nx: true, ex: 180).and_return(true)
+        expect(leader.acquire_or_extend).to be true
+      end
+
+      it "extends the TTL when this process already holds the lock" do
+        expect(conn).to receive(:set).with("test-lock", "node-a", nx: true, ex: 180).and_return(false)
+        expect(conn).to receive(:get).with("test-lock").and_return("node-a")
+        expect(conn).to receive(:expire).with("test-lock", 180).and_return(true)
+        expect(leader.acquire_or_extend).to be true
+      end
+
+      it "returns false when another process holds the lock" do
+        expect(conn).to receive(:set).with("test-lock", "node-a", nx: true, ex: 180).and_return(false)
+        expect(conn).to receive(:get).with("test-lock").and_return("node-b")
+        expect(conn).not_to receive(:expire)
+        expect(leader.acquire_or_extend).to be false
+      end
+    end
+
+    describe "#release" do
+      it "deletes the lock when this process holds it" do
+        expect(conn).to receive(:get).with("test-lock").and_return("node-a")
+        expect(conn).to receive(:del).with("test-lock")
+        leader.release
+      end
+
+      it "leaves the lock alone when held by another process" do
+        expect(conn).to receive(:get).with("test-lock").and_return("node-b")
+        expect(conn).not_to receive(:del)
+        leader.release
+      end
+
+      it "swallows errors so shutdown is never blocked by Redis hiccups" do
+        allow(conn).to receive(:get).and_raise(RuntimeError, "boom")
+        expect { leader.release }.not_to raise_error
+      end
+    end
+
+    describe "TTL defaults" do
+      it "defaults to 3× the publish interval" do
+        leader = described_class.new(key: "k", interval: 30)
+        expect(leader.ttl).to eq(90)
+      end
+
+      it "accepts a custom ttl" do
+        leader = described_class.new(key: "k", interval: 30, ttl: 200)
+        expect(leader.ttl).to eq(200)
+      end
+    end
+
+    describe "instance id" do
+      it "is unique across processes" do
+        id1 = described_class.new(key: "k", interval: 60).id
+        id2 = described_class.new(key: "k", interval: 60).id
+        expect(id1).not_to eq(id2)
+        expect(id1).to include(Socket.gethostname)
       end
     end
   end
