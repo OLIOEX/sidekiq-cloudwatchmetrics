@@ -140,6 +140,14 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
         allow(Sidekiq::Stats).to receive(:new).and_return(stats)
         allow(Sidekiq::ProcessSet).to receive(:new).and_return(processes)
         allow(Sidekiq::Queue).to receive(:new) { |name| queues.fetch(name) }
+        # By default neutralize the execution-histogram code path so existing
+        # tests don't need to know about it. The dedicated context below
+        # overrides these stubs to exercise the percentile calculation.
+        if defined?(Sidekiq::Metrics::Query)
+          allow(Sidekiq::Metrics::Query).to receive(:new).and_return(
+            double(top_jobs: double(job_results: {})),
+          )
+        end
       end
 
       it "publishes sidekiq metrics to cloudwatch" do
@@ -650,6 +658,123 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
                 ),
               )
             end
+          end
+        end
+
+        context "selecting job execution time percentiles", if: defined?(Sidekiq::Metrics::Query) do
+          subject(:publisher) do
+            Sidekiq::CloudWatchMetrics::Publisher.new(
+              client: client,
+              metrics: %i[job_execution_time_p50 job_execution_time_p95 job_execution_time_p99],
+            )
+          end
+
+          let(:fake_conn) { double(:redis_conn) }
+
+          # 26-bucket histograms, matching Sidekiq::Metrics::Histogram::BUCKET_INTERVALS.
+          #   FastJob: 100 samples in bucket 0 → every percentile lands at 20ms.
+          let(:fast_job_buckets) { [100] + Array.new(25, 0) }
+
+          # SlowJob: 90 in bucket 0 (≤20ms), 8 in bucket 10 (≤1.1s), 2 in bucket 17 (≤20s).
+          #   p50 → cumulative 90 at idx 0  → 20ms   = 0.02s
+          #   p95 → cumulative 98 at idx 10 → 1100ms = 1.1s
+          #   p99 → cumulative 100 at idx 17 → 20000ms = 20s
+          let(:slow_job_buckets) do
+            Array.new(26, 0).tap do |buckets|
+              buckets[0]  = 90
+              buckets[10] = 8
+              buckets[17] = 2
+            end
+          end
+
+          before do
+            job_results = {"FastJob" => double(:fast_result), "SlowJob" => double(:slow_result)}
+            allow(Sidekiq::Metrics::Query).to receive(:new).and_return(
+              double(top_jobs: double(job_results: job_results)),
+            )
+
+            allow(Sidekiq).to receive(:redis).and_yield(fake_conn)
+
+            fast_hist = double(:fast_histogram, fetch: fast_job_buckets)
+            slow_hist = double(:slow_histogram, fetch: slow_job_buckets)
+            allow(Sidekiq::Metrics::Histogram).to receive(:new).with("FastJob").and_return(fast_hist)
+            allow(Sidekiq::Metrics::Histogram).to receive(:new).with("SlowJob").and_return(slow_hist)
+          end
+
+          it "publishes per-class p50/p95/p99 derived from the execution histograms" do
+            Timecop.freeze(now = Time.now) do
+              publisher.publish
+
+              expect(client).to have_received(:put_metric_data).with(
+                namespace: "Sidekiq",
+                metric_data: contain_exactly(
+                  {metric_name: "JobExecutionTimeP50", dimensions: [{name: "JobClass", value: "FastJob"}], timestamp: now, value: 0.02, unit: "Seconds"},
+                  {metric_name: "JobExecutionTimeP95", dimensions: [{name: "JobClass", value: "FastJob"}], timestamp: now, value: 0.02, unit: "Seconds"},
+                  {metric_name: "JobExecutionTimeP99", dimensions: [{name: "JobClass", value: "FastJob"}], timestamp: now, value: 0.02, unit: "Seconds"},
+                  {metric_name: "JobExecutionTimeP50", dimensions: [{name: "JobClass", value: "SlowJob"}], timestamp: now, value: 0.02, unit: "Seconds"},
+                  {metric_name: "JobExecutionTimeP95", dimensions: [{name: "JobClass", value: "SlowJob"}], timestamp: now, value: 1.1, unit: "Seconds"},
+                  {metric_name: "JobExecutionTimeP99", dimensions: [{name: "JobClass", value: "SlowJob"}], timestamp: now, value: 20.0, unit: "Seconds"},
+                ),
+              )
+            end
+          end
+
+          it "does not call Sidekiq::Stats, ProcessSet, or Queue" do
+            expect(Sidekiq::Stats).not_to receive(:new)
+            expect(Sidekiq::ProcessSet).not_to receive(:new)
+            expect(Sidekiq::Queue).not_to receive(:new)
+            publisher.publish
+          end
+
+          context "when the percentile falls into the final \"Slow\" bucket" do
+            let(:slow_job_buckets) { Array.new(25, 0) + [5] }
+
+            it "clamps to the previous bucket's upper bound to keep the value plottable" do
+              # BUCKET_INTERVALS[24] = 335000 → 335.0s
+              Timecop.freeze(now = Time.now) do
+                publisher.publish
+
+                expect(client).to have_received(:put_metric_data).with(
+                  namespace: "Sidekiq",
+                  metric_data: include(
+                    {metric_name: "JobExecutionTimeP99", dimensions: [{name: "JobClass", value: "SlowJob"}], timestamp: now, value: 335.0, unit: "Seconds"},
+                  ),
+                )
+              end
+            end
+          end
+
+          context "with a class that has no recorded activity" do
+            let(:slow_job_buckets) { Array.new(26, 0) }
+
+            it "publishes nothing for that class" do
+              Timecop.freeze(now = Time.now) do
+                publisher.publish
+
+                expect(client).to have_received(:put_metric_data).with(
+                  namespace: "Sidekiq",
+                  metric_data: contain_exactly(
+                    {metric_name: "JobExecutionTimeP50", dimensions: [{name: "JobClass", value: "FastJob"}], timestamp: now, value: 0.02, unit: "Seconds"},
+                    {metric_name: "JobExecutionTimeP95", dimensions: [{name: "JobClass", value: "FastJob"}], timestamp: now, value: 0.02, unit: "Seconds"},
+                    {metric_name: "JobExecutionTimeP99", dimensions: [{name: "JobClass", value: "FastJob"}], timestamp: now, value: 0.02, unit: "Seconds"},
+                  ),
+                )
+              end
+            end
+          end
+        end
+
+        context "when Sidekiq::Metrics is not available" do
+          subject(:publisher) do
+            Sidekiq::CloudWatchMetrics::Publisher.new(client: client, metrics: [:job_execution_time_p99])
+          end
+
+          it "silently skips the execution-histogram metrics" do
+            allow(publisher).to receive(:execution_histograms_supported?).and_return(false)
+
+            publisher.publish
+
+            expect(client).not_to have_received(:put_metric_data)
           end
         end
 

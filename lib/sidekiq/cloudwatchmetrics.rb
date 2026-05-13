@@ -64,12 +64,27 @@ module Sidekiq::CloudWatchMetrics
     PROCESS_METRICS = %i[process_utilization].freeze
     QUEUE_METRICS = %i[queue_size queue_latency].freeze
 
+    # Per-job-class execution time percentiles, derived from the histogram data
+    # Sidekiq 7+ records in Redis via Sidekiq::Metrics::ExecutionTracker.
+    EXECUTION_HISTOGRAM_METRICS = %i[
+      job_execution_time_p50
+      job_execution_time_p95
+      job_execution_time_p99
+    ].freeze
+
+    EXECUTION_HISTOGRAM_PERCENTILES = {
+      job_execution_time_p50: [0.50, "JobExecutionTimeP50"],
+      job_execution_time_p95: [0.95, "JobExecutionTimeP95"],
+      job_execution_time_p99: [0.99, "JobExecutionTimeP99"],
+    }.freeze
+
     ALL_METRICS = (
       GLOBAL_STATS_METRICS +
       GLOBAL_AGGREGATE_METRICS +
       TAG_METRICS +
       PROCESS_METRICS +
-      QUEUE_METRICS
+      QUEUE_METRICS +
+      EXECUTION_HISTOGRAM_METRICS
     ).freeze
 
     private def default_config
@@ -215,6 +230,19 @@ module Sidekiq::CloudWatchMetrics
         end
       end
 
+      if enabled_any?(EXECUTION_HISTOGRAM_METRICS) && execution_histograms_supported?
+        fetch_recent_execution_histograms.each do |klass, buckets|
+          job_dimensions = [{name: "JobClass", value: klass}]
+          EXECUTION_HISTOGRAM_METRICS.each do |key|
+            next unless enabled?(key)
+            percentile, metric_name = EXECUTION_HISTOGRAM_PERCENTILES.fetch(key)
+            seconds = percentile_seconds(buckets, percentile)
+            next if seconds.nil?
+            metrics << build_metric(metric_name, seconds, now, unit: "Seconds", dimensions: job_dimensions)
+          end
+        end
+      end
+
       unless @additional_dimensions.empty?
         metrics.each do |metric|
           metric[:dimensions] = (metric[:dimensions] || []) + @additional_dimensions
@@ -272,6 +300,55 @@ module Sidekiq::CloudWatchMetrics
       end
 
       enabled
+    end
+
+    # Sidekiq 7 introduced the in-process ExecutionTracker, which records
+    # per-class execution time histograms in Redis. The publisher reads those
+    # histograms (not raw timings) so each tick is cheap regardless of throughput.
+    private def execution_histograms_supported?
+      defined?(Sidekiq::Metrics::Query) && defined?(Sidekiq::Metrics::Histogram)
+    end
+
+    # The ExecutionTracker flushes to Redis on each Sidekiq heartbeat (~10s),
+    # so we query the previous full minute to avoid racing an in-progress flush.
+    # Returns { class_name => [bucket_count, ...] } for classes with activity.
+    private def fetch_recent_execution_histograms
+      query_time = Time.now - 60
+      query = Sidekiq::Metrics::Query.new(now: query_time)
+      result = query.top_jobs(minutes: 1)
+      return {} if result.job_results.empty?
+
+      histograms = {}
+      Sidekiq.redis do |conn|
+        result.job_results.each_key do |klass|
+          buckets = Sidekiq::Metrics::Histogram.new(klass).fetch(conn, query_time)
+          next if buckets.nil? || buckets.sum.zero?
+          histograms[klass] = buckets
+        end
+      end
+      histograms
+    end
+
+    # Computes a percentile from Sidekiq's 26-bucket execution histogram.
+    # Each bucket's upper bound comes from Sidekiq::Metrics::Histogram::BUCKET_INTERVALS;
+    # we report that upper bound (a conservative over-estimate). The final
+    # "Slow" bucket has an effectively infinite upper bound, so we clamp it to
+    # the previous bucket's upper bound to keep the published value plottable.
+    private def percentile_seconds(buckets, percentile)
+      total = buckets.sum
+      return nil if total.zero?
+
+      intervals = Sidekiq::Metrics::Histogram::BUCKET_INTERVALS
+      last_index = intervals.size - 1
+      target = total * percentile
+      cumulative = 0
+      buckets.each_with_index do |count, idx|
+        cumulative += count
+        next if cumulative < target
+        upper_ms = (idx == last_index) ? intervals[last_index - 1] : intervals[idx]
+        return upper_ms / 1000.0
+      end
+      nil
     end
 
     # Returns the total number of workers across all processes

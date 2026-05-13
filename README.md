@@ -105,8 +105,21 @@ Available metric keys:
 | `:process_utilization`  | `Utilization`         | per process (Hostname dimension)       |
 | `:queue_size`           | `QueueSize`           | per queue                              |
 | `:queue_latency`        | `QueueLatency`        | per queue                              |
+| `:job_execution_time_p50` | `JobExecutionTimeP50` | per job class (Sidekiq 7+)           |
+| `:job_execution_time_p95` | `JobExecutionTimeP95` | per job class (Sidekiq 7+)           |
+| `:job_execution_time_p99` | `JobExecutionTimeP99` | per job class (Sidekiq 7+)           |
 
 Unknown symbols raise `ArgumentError` at boot.
+
+The `job_execution_time_*` metrics are derived from the execution histograms
+Sidekiq 7+ records in Redis via its built-in `ExecutionTracker` middleware.
+Each tick reads the previous full minute's histograms once and computes the
+requested percentiles from the bucket counts (resolution is whichever
+`Sidekiq::Metrics::Histogram::BUCKET_INTERVALS` bucket the percentile falls
+into — e.g. `1.7s`, `2.5s`, `3.8s`). They are silently skipped on Sidekiq
+versions that don't ship `Sidekiq::Metrics`. Use them on the standard 60s
+publisher, not on burst publishers — the source data only updates once per
+minute.
 
 The legacy `process_metrics:` boolean is still accepted for backwards
 compatibility but emits a deprecation warning — prefer the `metrics:` option
