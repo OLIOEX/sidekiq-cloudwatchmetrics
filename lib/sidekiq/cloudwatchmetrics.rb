@@ -439,8 +439,19 @@ module Sidekiq::CloudWatchMetrics
       ordered = histograms.sort_by { |klass, buckets| [-buckets.sum, klass] }
       top = ordered.take(@max_job_classes).to_h
       tail_buckets = ordered.drop(@max_job_classes).map(&:last)
-      top[OTHER_JOB_CLASS] = tail_buckets.transpose.map(&:sum)
+      top[OTHER_JOB_CLASS] = sum_buckets_elementwise(tail_buckets)
       top
+    end
+
+    # Sidekiq's histogram is fixed-width (26 buckets) today, so a plain
+    # `transpose` would also work; padding short arrays with zeros keeps the
+    # publisher alive if a future Sidekiq upgrade changes the bucket count or
+    # an individual class returns a shorter array.
+    private def sum_buckets_elementwise(buckets_list)
+      width = buckets_list.map(&:size).max
+      Array.new(width) do |i|
+        buckets_list.sum { |buckets| buckets[i] || 0 }
+      end
     end
 
     private def resolve_max_job_classes(value)

@@ -892,6 +892,27 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
               end
             end
           end
+
+          context "when tail histograms have uneven bucket widths" do
+            let(:job_buckets) do
+              {
+                "BusiestJob" => [50, 0, 0],
+                "MidJob"     => [30, 0, 0],
+                "ShortJob"   => [2, 1],
+                "LongJob"    => [1, 1, 1, 1],
+              }
+            end
+
+            it "sums element-wise without raising, padding short arrays with zeros" do
+              expect { publisher.publish }.not_to raise_error
+
+              expect(client).to have_received(:put_metric_data) do |args|
+                other = args[:metric_data].find { |m| m[:dimensions].first[:value] == "(other)" }
+                # ShortJob sum=3 + LongJob sum=4 → (other) sum = 7
+                expect(other[:value]).to eq(7.0)
+              end
+            end
+          end
         end
 
         context "with max_job_classes set to a non-positive value" do
