@@ -778,6 +778,100 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
           end
         end
 
+        context "capping JobClass cardinality", if: defined?(Sidekiq::Metrics::Query) do
+          let(:fake_conn) { double(:redis_conn) }
+
+          # Three buckets per class so the test stays readable; cap_job_class_cardinality
+          # uses transpose+sum so it works for any histogram width.
+          let(:job_buckets) do
+            {
+              "BusiestJob" => [50, 0, 0],
+              "MidJob"     => [30, 0, 0],
+              "RareJobA"   => [3,  0, 0],
+              "RareJobB"   => [1,  2, 0],
+            }
+          end
+
+          before do
+            job_results = job_buckets.transform_values { |_| double(:result) }
+            allow(Sidekiq::Metrics::Query).to receive(:new).and_return(
+              double(top_jobs: double(job_results: job_results)),
+            )
+            allow(Sidekiq).to receive(:redis).and_yield(fake_conn)
+            job_buckets.each do |klass, buckets|
+              histogram = double(:"#{klass}_histogram", fetch: buckets)
+              allow(Sidekiq::Metrics::Histogram).to receive(:new).with(klass).and_return(histogram)
+            end
+            # Stub the percentile calculation to make assertions about which
+            # classes get published — the bucket maths is covered elsewhere.
+            allow_any_instance_of(Sidekiq::CloudWatchMetrics::Publisher)
+              .to receive(:percentile_seconds) { |_pub, buckets, _pct| buckets.sum.to_f }
+          end
+
+          subject(:publisher) do
+            Sidekiq::CloudWatchMetrics::Publisher.new(
+              client: client, metrics: [:job_execution_time_p99], max_job_classes: 2,
+            )
+          end
+
+          it "keeps the busiest classes and rolls the rest into an Other series" do
+            publisher.publish
+
+            published = client.instance_variable_get(:@put_metric_data_call) || nil
+            expect(client).to have_received(:put_metric_data) do |args|
+              job_classes = args[:metric_data].map { |m| m[:dimensions].first[:value] }
+              expect(job_classes).to contain_exactly("BusiestJob", "MidJob", "Other")
+
+              other = args[:metric_data].find { |m| m[:dimensions].first[:value] == "Other" }
+              # RareJobA (sum=3) + RareJobB (sum=3) → Other sum = 6
+              expect(other[:value]).to eq(6.0)
+            end
+          end
+
+          context "with max_job_classes: nil (uncapped)" do
+            subject(:publisher) do
+              Sidekiq::CloudWatchMetrics::Publisher.new(
+                client: client, metrics: [:job_execution_time_p99], max_job_classes: nil,
+              )
+            end
+
+            it "publishes one series per class with no Other bucket" do
+              publisher.publish
+
+              expect(client).to have_received(:put_metric_data) do |args|
+                job_classes = args[:metric_data].map { |m| m[:dimensions].first[:value] }
+                expect(job_classes).to contain_exactly("BusiestJob", "MidJob", "RareJobA", "RareJobB")
+              end
+            end
+          end
+
+          context "when the number of classes is at or below the cap" do
+            subject(:publisher) do
+              Sidekiq::CloudWatchMetrics::Publisher.new(
+                client: client, metrics: [:job_execution_time_p99], max_job_classes: 10,
+              )
+            end
+
+            it "publishes one series per class with no Other bucket" do
+              publisher.publish
+
+              expect(client).to have_received(:put_metric_data) do |args|
+                job_classes = args[:metric_data].map { |m| m[:dimensions].first[:value] }
+                expect(job_classes).not_to include("Other")
+                expect(job_classes.size).to eq(job_buckets.size)
+              end
+            end
+          end
+        end
+
+        context "with max_job_classes set to a non-positive value" do
+          it "raises ArgumentError at init" do
+            expect {
+              Sidekiq::CloudWatchMetrics::Publisher.new(client: client, max_job_classes: 0)
+            }.to raise_error(ArgumentError, /max_job_classes must be positive/)
+          end
+        end
+
         context "with an unknown metric" do
           it "raises ArgumentError at init" do
             expect {

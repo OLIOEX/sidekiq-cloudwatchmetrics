@@ -130,6 +130,14 @@ module Sidekiq::CloudWatchMetrics
       job_execution_time_p99: [0.99, "JobExecutionTimeP99"],
     }.freeze
 
+    # Each distinct JobClass dimension value is a separate CloudWatch billable
+    # metric; long-tail apps with hundreds of job classes pay for noise that
+    # rarely informs decisions. Above this cap the publisher keeps the top
+    # contributors by sample count and rolls everything else into a single
+    # "Other" series so operators still see overall long-tail latency.
+    DEFAULT_MAX_JOB_CLASSES = 20
+    OTHER_JOB_CLASS = "Other"
+
     ALL_METRICS = (
       GLOBAL_STATS_METRICS +
       GLOBAL_AGGREGATE_METRICS +
@@ -149,7 +157,7 @@ module Sidekiq::CloudWatchMetrics
       end
     end
 
-    def initialize(config: default_config, client: Aws::CloudWatch::Client.new, namespace: "Sidekiq", process_metrics: nil, additional_dimensions: {}, interval: DEFAULT_INTERVAL, metrics: nil, leader_election: nil)
+    def initialize(config: default_config, client: Aws::CloudWatch::Client.new, namespace: "Sidekiq", process_metrics: nil, additional_dimensions: {}, interval: DEFAULT_INTERVAL, metrics: nil, leader_election: nil, max_job_classes: DEFAULT_MAX_JOB_CLASSES)
       # Required by Sidekiq::Component (in sidekiq 6.5+)
       @config = config
 
@@ -160,6 +168,7 @@ module Sidekiq::CloudWatchMetrics
 
       @enabled_metrics = resolve_enabled_metrics(metrics, process_metrics)
       @leader = build_leader(leader_election)
+      @max_job_classes = resolve_max_job_classes(max_job_classes)
     end
 
     def start
@@ -391,7 +400,8 @@ module Sidekiq::CloudWatchMetrics
 
     # The ExecutionTracker flushes to Redis on each Sidekiq heartbeat (~10s),
     # so we query the previous full minute to avoid racing an in-progress flush.
-    # Returns { class_name => [bucket_count, ...] } for classes with activity.
+    # Returns { class_name => [bucket_count, ...] } for classes with activity,
+    # capped at @max_job_classes with the long tail rolled into "Other".
     private def fetch_recent_execution_histograms
       query_time = Time.now - 60
       query = Sidekiq::Metrics::Query.new(now: query_time)
@@ -406,7 +416,28 @@ module Sidekiq::CloudWatchMetrics
           histograms[klass] = buckets
         end
       end
-      histograms
+
+      cap_job_class_cardinality(histograms)
+    end
+
+    # Reduces { class => buckets } to at most @max_job_classes entries by
+    # keeping the busiest classes (sum of bucket counts) and combining the
+    # rest element-wise into a single "Other" histogram.
+    private def cap_job_class_cardinality(histograms)
+      return histograms if @max_job_classes.nil? || histograms.size <= @max_job_classes
+
+      ordered = histograms.sort_by { |_klass, buckets| -buckets.sum }
+      top = ordered.take(@max_job_classes).to_h
+      tail_buckets = ordered.drop(@max_job_classes).map(&:last)
+      top[OTHER_JOB_CLASS] = tail_buckets.transpose.map(&:sum)
+      top
+    end
+
+    private def resolve_max_job_classes(value)
+      return nil if value.nil?
+      Integer(value).tap do |int_value|
+        raise ArgumentError, "max_job_classes must be positive (got #{int_value})" if int_value < 1
+      end
     end
 
     # Computes a percentile from Sidekiq's 26-bucket execution histogram.
