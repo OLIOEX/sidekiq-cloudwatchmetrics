@@ -861,6 +861,37 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
               end
             end
           end
+
+          context "when two tail classes tie on sample count" do
+            let(:job_buckets) do
+              {
+                "BusiestJob" => [50, 0, 0],
+                "MidJob"     => [30, 0, 0],
+                "TieJobZ"    => [5,  0, 0],
+                "TieJobA"    => [5,  0, 0],
+              }
+            end
+
+            it "breaks ties by class name so borderline classes don't flap across cycles" do
+              # max_job_classes: 3 keeps BusiestJob, MidJob, and one of the
+              # tied pair. Without a stable secondary sort key the survivor
+              # would depend on hash ordering.
+              publisher = Sidekiq::CloudWatchMetrics::Publisher.new(
+                client: client, metrics: [:job_execution_time_p99], max_job_classes: 3,
+              )
+
+              publisher.publish
+
+              expect(client).to have_received(:put_metric_data) do |args|
+                job_classes = args[:metric_data].map { |m| m[:dimensions].first[:value] }
+                # Ascending class name wins the tie → TieJobA survives,
+                # TieJobZ rolls into (other).
+                expect(job_classes).to contain_exactly(
+                  "BusiestJob", "MidJob", "TieJobA", "(other)",
+                )
+              end
+            end
+          end
         end
 
         context "with max_job_classes set to a non-positive value" do

@@ -430,11 +430,13 @@ module Sidekiq::CloudWatchMetrics
 
     # Reduces { class => buckets } to at most @max_job_classes entries by
     # keeping the busiest classes (sum of bucket counts) and combining the
-    # rest element-wise into a single `(other)` histogram.
+    # rest element-wise into a single `(other)` histogram. The class name
+    # is used as a secondary sort key so borderline classes with identical
+    # sample counts don't flap in and out of the rollup across cycles.
     private def cap_job_class_cardinality(histograms)
       return histograms if @max_job_classes.nil? || histograms.size <= @max_job_classes
 
-      ordered = histograms.sort_by { |_klass, buckets| -buckets.sum }
+      ordered = histograms.sort_by { |klass, buckets| [-buckets.sum, klass] }
       top = ordered.take(@max_job_classes).to_h
       tail_buckets = ordered.drop(@max_job_classes).map(&:last)
       top[OTHER_JOB_CLASS] = tail_buckets.transpose.map(&:sum)
