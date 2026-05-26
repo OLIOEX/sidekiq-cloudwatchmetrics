@@ -666,6 +666,7 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
             Sidekiq::CloudWatchMetrics::Publisher.new(
               client: client,
               metrics: %i[job_execution_time_p50 job_execution_time_p95 job_execution_time_p99],
+              min_job_seconds: nil, # disable the duration filter for these tests
             )
           end
 
@@ -778,17 +779,24 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
           end
         end
 
-        context "capping JobClass cardinality", if: defined?(Sidekiq::Metrics::Query) do
+        context "filtering by minimum execution time", if: defined?(Sidekiq::Metrics::Query) do
           let(:fake_conn) { double(:redis_conn) }
 
-          # Three buckets per class so the test stays readable; cap_job_class_cardinality
-          # uses transpose+sum so it works for any histogram width.
+          # 26-bucket histograms. Bucket upper bounds (BUCKET_INTERVALS) start
+          # at 20ms and reach 500ms at index 8; index 9's upper is 750ms — so
+          # any sample in bucket >= 9 took strictly more than 500ms.
+          let(:fast_job_buckets) { [100] + Array.new(25, 0) }                   # everything ≤ 20ms
+          let(:slow_outlier_buckets) do                                          # mostly fast, one slow sample
+            Array.new(26, 0).tap { |b| b[0] = 99; b[9] = 1 }                    # 99 ≤ 20ms + 1 in 500-750ms bucket
+          end
+          let(:consistently_slow_buckets) do                                     # all samples in 500-750ms bucket
+            Array.new(26, 0).tap { |b| b[9] = 50 }
+          end
           let(:job_buckets) do
             {
-              "BusiestJob" => [50, 0, 0],
-              "MidJob"     => [30, 0, 0],
-              "RareJobA"   => [3,  0, 0],
-              "RareJobB"   => [1,  2, 0],
+              "FastJob"           => fast_job_buckets,
+              "SlowOutlierJob"    => slow_outlier_buckets,
+              "ConsistentSlowJob" => consistently_slow_buckets,
             }
           end
 
@@ -802,124 +810,89 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
               histogram = double(:"#{klass}_histogram", fetch: buckets)
               allow(Sidekiq::Metrics::Histogram).to receive(:new).with(klass).and_return(histogram)
             end
-            # Stub the percentile calculation to make assertions about which
-            # classes get published — the bucket maths is covered elsewhere.
-            allow_any_instance_of(Sidekiq::CloudWatchMetrics::Publisher)
-              .to receive(:percentile_seconds) { |_pub, buckets, _pct| buckets.sum.to_f }
           end
 
           subject(:publisher) do
             Sidekiq::CloudWatchMetrics::Publisher.new(
-              client: client, metrics: [:job_execution_time_p99], max_job_classes: 2,
+              client: client,
+              metrics: [:job_execution_time_p99],
+              min_job_seconds: 0.5,
             )
           end
 
-          it "keeps the busiest classes and rolls the rest into an (other) series" do
+          it "publishes only classes with at least one sample slower than the threshold" do
             publisher.publish
 
             expect(client).to have_received(:put_metric_data) do |args|
               job_classes = args[:metric_data].map { |m| m[:dimensions].first[:value] }
-              expect(job_classes).to contain_exactly("BusiestJob", "MidJob", "(other)")
-
-              other = args[:metric_data].find { |m| m[:dimensions].first[:value] == "(other)" }
-              # RareJobA (sum=3) + RareJobB (sum=3) → (other) sum = 6
-              expect(other[:value]).to eq(6.0)
+              expect(job_classes).to contain_exactly("SlowOutlierJob", "ConsistentSlowJob")
+              # FastJob has all samples in bucket 0 (≤20ms) — well under 500ms, dropped.
             end
           end
 
-          context "with max_job_classes: nil (uncapped)" do
+          context "with min_job_seconds: nil (filter disabled)" do
             subject(:publisher) do
               Sidekiq::CloudWatchMetrics::Publisher.new(
-                client: client, metrics: [:job_execution_time_p99], max_job_classes: nil,
+                client: client,
+                metrics: [:job_execution_time_p99],
+                min_job_seconds: nil,
               )
             end
 
-            it "publishes one series per class with no rollup bucket" do
+            it "publishes every class with any recorded activity" do
               publisher.publish
 
               expect(client).to have_received(:put_metric_data) do |args|
                 job_classes = args[:metric_data].map { |m| m[:dimensions].first[:value] }
-                expect(job_classes).to contain_exactly("BusiestJob", "MidJob", "RareJobA", "RareJobB")
-              end
-            end
-          end
-
-          context "when the number of classes is at or below the cap" do
-            subject(:publisher) do
-              Sidekiq::CloudWatchMetrics::Publisher.new(
-                client: client, metrics: [:job_execution_time_p99], max_job_classes: 10,
-              )
-            end
-
-            it "publishes one series per class with no rollup bucket" do
-              publisher.publish
-
-              expect(client).to have_received(:put_metric_data) do |args|
-                job_classes = args[:metric_data].map { |m| m[:dimensions].first[:value] }
-                expect(job_classes).not_to include("(other)")
-                expect(job_classes.size).to eq(job_buckets.size)
-              end
-            end
-          end
-
-          context "when two tail classes tie on sample count" do
-            let(:job_buckets) do
-              {
-                "BusiestJob" => [50, 0, 0],
-                "MidJob"     => [30, 0, 0],
-                "TieJobZ"    => [5,  0, 0],
-                "TieJobA"    => [5,  0, 0],
-              }
-            end
-
-            it "breaks ties by class name so borderline classes don't flap across cycles" do
-              # max_job_classes: 3 keeps BusiestJob, MidJob, and one of the
-              # tied pair. Without a stable secondary sort key the survivor
-              # would depend on hash ordering.
-              publisher = Sidekiq::CloudWatchMetrics::Publisher.new(
-                client: client, metrics: [:job_execution_time_p99], max_job_classes: 3,
-              )
-
-              publisher.publish
-
-              expect(client).to have_received(:put_metric_data) do |args|
-                job_classes = args[:metric_data].map { |m| m[:dimensions].first[:value] }
-                # Ascending class name wins the tie → TieJobA survives,
-                # TieJobZ rolls into (other).
                 expect(job_classes).to contain_exactly(
-                  "BusiestJob", "MidJob", "TieJobA", "(other)",
+                  "FastJob", "SlowOutlierJob", "ConsistentSlowJob",
                 )
               end
             end
           end
 
-          context "when tail histograms have uneven bucket widths" do
-            let(:job_buckets) do
-              {
-                "BusiestJob" => [50, 0, 0],
-                "MidJob"     => [30, 0, 0],
-                "ShortJob"   => [2, 1],
-                "LongJob"    => [1, 1, 1, 1],
-              }
+          context "with a threshold below the first bucket boundary" do
+            subject(:publisher) do
+              Sidekiq::CloudWatchMetrics::Publisher.new(
+                client: client,
+                metrics: [:job_execution_time_p99],
+                min_job_seconds: 0.01, # 10ms — below bucket 0's upper bound of 20ms
+              )
             end
 
-            it "sums element-wise without raising, padding short arrays with zeros" do
-              expect { publisher.publish }.not_to raise_error
+            it "publishes every class with any activity" do
+              publisher.publish
 
               expect(client).to have_received(:put_metric_data) do |args|
-                other = args[:metric_data].find { |m| m[:dimensions].first[:value] == "(other)" }
-                # ShortJob sum=3 + LongJob sum=4 → (other) sum = 7
-                expect(other[:value]).to eq(7.0)
+                job_classes = args[:metric_data].map { |m| m[:dimensions].first[:value] }
+                expect(job_classes).to contain_exactly(
+                  "FastJob", "SlowOutlierJob", "ConsistentSlowJob",
+                )
               end
+            end
+          end
+
+          context "with a threshold beyond the histogram's slowest bucket" do
+            subject(:publisher) do
+              Sidekiq::CloudWatchMetrics::Publisher.new(
+                client: client,
+                metrics: [:job_execution_time_p99],
+                min_job_seconds: 600, # > 500000ms upper bound of the slowest bucket
+              )
+            end
+
+            it "publishes nothing" do
+              publisher.publish
+
+              expect(client).not_to have_received(:put_metric_data)
             end
           end
         end
 
-        context "with max_job_classes set to a non-positive value" do
-          it "raises ArgumentError at init" do
-            expect {
-              Sidekiq::CloudWatchMetrics::Publisher.new(client: client, max_job_classes: 0)
-            }.to raise_error(ArgumentError, /max_job_classes must be positive/)
+        context "with min_job_seconds set to a non-positive value" do
+          it "treats it as nil (filter disabled)" do
+            publisher = Sidekiq::CloudWatchMetrics::Publisher.new(client: client, min_job_seconds: 0)
+            expect(publisher.instance_variable_get(:@min_job_seconds)).to be_nil
           end
         end
 

@@ -131,14 +131,12 @@ module Sidekiq::CloudWatchMetrics
     }.freeze
 
     # Each distinct JobClass dimension value is a separate CloudWatch billable
-    # metric; long-tail apps with hundreds of job classes pay for noise that
-    # rarely informs decisions. Above this cap the publisher keeps the top
-    # contributors by sample count and rolls everything else into a single
-    # `(other)` series so operators still see overall long-tail latency.
-    DEFAULT_MAX_JOB_CLASSES = 20
-    # Parenthesised so it can never collide with a real Ruby class name —
-    # `(other)` is not a valid constant identifier.
-    OTHER_JOB_CLASS = "(other)"
+    # metric; long-tail apps with hundreds of job classes pay for noise on jobs
+    # that complete in milliseconds. Only classes with at least one execution
+    # exceeding this threshold (in seconds) publish per-class percentile series.
+    # Fast jobs are dropped entirely — the global publisher-level metrics still
+    # cover overall throughput.
+    DEFAULT_MIN_JOB_SECONDS = 0.5
 
     ALL_METRICS = (
       GLOBAL_STATS_METRICS +
@@ -159,7 +157,7 @@ module Sidekiq::CloudWatchMetrics
       end
     end
 
-    def initialize(config: default_config, client: Aws::CloudWatch::Client.new, namespace: "Sidekiq", process_metrics: nil, additional_dimensions: {}, interval: DEFAULT_INTERVAL, metrics: nil, leader_election: nil, max_job_classes: DEFAULT_MAX_JOB_CLASSES)
+    def initialize(config: default_config, client: Aws::CloudWatch::Client.new, namespace: "Sidekiq", process_metrics: nil, additional_dimensions: {}, interval: DEFAULT_INTERVAL, metrics: nil, leader_election: nil, min_job_seconds: DEFAULT_MIN_JOB_SECONDS)
       # Required by Sidekiq::Component (in sidekiq 6.5+)
       @config = config
 
@@ -170,7 +168,7 @@ module Sidekiq::CloudWatchMetrics
 
       @enabled_metrics = resolve_enabled_metrics(metrics, process_metrics)
       @leader = build_leader(leader_election)
-      @max_job_classes = resolve_max_job_classes(max_job_classes)
+      @min_job_seconds = resolve_min_job_seconds(min_job_seconds)
     end
 
     def start
@@ -408,8 +406,9 @@ module Sidekiq::CloudWatchMetrics
 
     # The ExecutionTracker flushes to Redis on each Sidekiq heartbeat (~10s),
     # so we query the previous full minute to avoid racing an in-progress flush.
-    # Returns { class_name => [bucket_count, ...] } for classes with activity,
-    # capped at @max_job_classes with the long tail rolled into `(other)`.
+    # Returns { class_name => [bucket_count, ...] } for classes that had at
+    # least one execution exceeding @min_job_seconds (when set). Fast jobs are
+    # dropped so they don't pay CloudWatch's per-metric cost.
     private def fetch_recent_execution_histograms
       query_time = Time.now - 60
       query = Sidekiq::Metrics::Query.new(now: query_time)
@@ -421,44 +420,32 @@ module Sidekiq::CloudWatchMetrics
         result.job_results.each_key do |klass|
           buckets = Sidekiq::Metrics::Histogram.new(klass).fetch(conn, query_time)
           next if buckets.nil? || buckets.sum.zero?
+          next unless slow_enough?(buckets)
           histograms[klass] = buckets
         end
       end
-
-      cap_job_class_cardinality(histograms)
+      histograms
     end
 
-    # Reduces { class => buckets } to at most @max_job_classes entries by
-    # keeping the busiest classes (sum of bucket counts) and combining the
-    # rest element-wise into a single `(other)` histogram. The class name
-    # is used as a secondary sort key so borderline classes with identical
-    # sample counts don't flap in and out of the rollup across cycles.
-    private def cap_job_class_cardinality(histograms)
-      return histograms if @max_job_classes.nil? || histograms.size <= @max_job_classes
+    # A histogram is "slow enough" if any sample landed in a bucket whose upper
+    # bound exceeds @min_job_seconds — i.e. at least one execution took longer
+    # than the threshold. When @min_job_seconds is nil/non-positive the filter
+    # is disabled and every class with activity publishes.
+    private def slow_enough?(buckets)
+      return true if @min_job_seconds.nil?
 
-      ordered = histograms.sort_by { |klass, buckets| [-buckets.sum, klass] }
-      top = ordered.take(@max_job_classes).to_h
-      tail_buckets = ordered.drop(@max_job_classes).map(&:last)
-      top[OTHER_JOB_CLASS] = sum_buckets_elementwise(tail_buckets)
-      top
+      threshold_ms = @min_job_seconds * 1000.0
+      intervals = Sidekiq::Metrics::Histogram::BUCKET_INTERVALS
+      slow_start = intervals.find_index { |upper| upper > threshold_ms }
+      return false unless slow_start
+      buckets[slow_start..].any? { |count| count.positive? }
     end
 
-    # Sidekiq's histogram is fixed-width (26 buckets) today, so a plain
-    # `transpose` would also work; padding short arrays with zeros keeps the
-    # publisher alive if a future Sidekiq upgrade changes the bucket count or
-    # an individual class returns a shorter array.
-    private def sum_buckets_elementwise(buckets_list)
-      width = buckets_list.map(&:size).max
-      Array.new(width) do |i|
-        buckets_list.sum { |buckets| buckets[i] || 0 }
-      end
-    end
-
-    private def resolve_max_job_classes(value)
+    private def resolve_min_job_seconds(value)
       return nil if value.nil?
-      Integer(value).tap do |int_value|
-        raise ArgumentError, "max_job_classes must be positive (got #{int_value})" if int_value < 1
-      end
+      float_value = Float(value)
+      return nil if float_value <= 0
+      float_value
     end
 
     # Computes a percentile from Sidekiq's 26-bucket execution histogram.

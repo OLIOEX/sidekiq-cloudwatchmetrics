@@ -166,29 +166,32 @@ Sidekiq::CloudWatchMetrics.enable!(
 )
 ```
 
-### Capping `JobClass` cardinality
+### Filtering fast jobs out of `job_execution_time_p*`
 
 `job_execution_time_p*` metrics publish one CloudWatch series per
 distinct Sidekiq job class, and every series is a separate billable
-custom metric. Long-tail apps with hundreds of job classes can pay for
-a lot of noise that rarely informs an operator decision.
+custom metric. In a typical app most jobs complete in tens of
+milliseconds — the per-class percentiles of those jobs land in the
+first histogram bucket and rarely inform an operator decision, but
+they each cost the same per-metric fee.
 
-By default the publisher caps `JobClass` cardinality at **20**: the 20
-classes with the most samples in the last minute keep their own
-series, and everything else is summed bucket-by-bucket into a single
-`JobClass=(other)` histogram. The parentheses make the rollup label
-distinct from any real Ruby class name. Operators still see overall
-long-tail latency without paying per-class for the long tail.
+By default the publisher skips any class that didn't have at least one
+execution slower than **0.5 seconds** in the last minute. Slow jobs —
+the ones operators actually care about — still get their own series.
+Fast jobs are dropped entirely; their throughput shows up in the
+global `ProcessedJobs` / `Workers` metrics.
 
 ```ruby
 Sidekiq::CloudWatchMetrics.enable!(
   metrics: %i[job_execution_time_p50 job_execution_time_p99],
-  max_job_classes: 20,  # default
+  min_job_seconds: 0.5,  # default
 )
 ```
 
-Pass `max_job_classes: nil` to publish every class with activity (the
-previous behaviour) or any positive integer to tune the cap.
+Pass `min_job_seconds: nil` (or `0`) to publish every class with any
+activity, or any positive number to tune the threshold. The filter
+operates on Sidekiq's histogram buckets, so a class qualifies if any
+sample landed in a bucket whose upper bound exceeds the threshold.
 
 ## Development
 
