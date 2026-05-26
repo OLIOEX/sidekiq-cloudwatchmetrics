@@ -166,6 +166,29 @@ Sidekiq::CloudWatchMetrics.enable!(
 )
 ```
 
+### Capping `JobClass` cardinality
+
+`job_execution_time_p*` metrics publish one CloudWatch series per
+distinct Sidekiq job class, and every series is a separate billable
+custom metric. Long-tail apps with hundreds of job classes can pay for
+a lot of noise that rarely informs an operator decision.
+
+By default the publisher caps `JobClass` cardinality at **20**: the 20
+classes with the most samples in the last minute keep their own
+series, and everything else is summed bucket-by-bucket into a single
+`JobClass=Other` histogram. Operators still see overall long-tail
+latency without paying per-class for the long tail.
+
+```ruby
+Sidekiq::CloudWatchMetrics.enable!(
+  metrics: %i[job_execution_time_p50 job_execution_time_p99],
+  max_job_classes: 20,  # default
+)
+```
+
+Pass `max_job_classes: nil` to publish every class with activity (the
+previous behaviour) or any positive integer to tune the cap.
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake spec` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.
