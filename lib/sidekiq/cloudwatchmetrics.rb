@@ -134,9 +134,11 @@ module Sidekiq::CloudWatchMetrics
     # metric; long-tail apps with hundreds of job classes pay for noise that
     # rarely informs decisions. Above this cap the publisher keeps the top
     # contributors by sample count and rolls everything else into a single
-    # "Other" series so operators still see overall long-tail latency.
+    # `(other)` series so operators still see overall long-tail latency.
     DEFAULT_MAX_JOB_CLASSES = 20
-    OTHER_JOB_CLASS = "Other"
+    # Parenthesised so it can never collide with a real Ruby class name —
+    # `(other)` is not a valid constant identifier.
+    OTHER_JOB_CLASS = "(other)"
 
     ALL_METRICS = (
       GLOBAL_STATS_METRICS +
@@ -407,7 +409,7 @@ module Sidekiq::CloudWatchMetrics
     # The ExecutionTracker flushes to Redis on each Sidekiq heartbeat (~10s),
     # so we query the previous full minute to avoid racing an in-progress flush.
     # Returns { class_name => [bucket_count, ...] } for classes with activity,
-    # capped at @max_job_classes with the long tail rolled into "Other".
+    # capped at @max_job_classes with the long tail rolled into `(other)`.
     private def fetch_recent_execution_histograms
       query_time = Time.now - 60
       query = Sidekiq::Metrics::Query.new(now: query_time)
@@ -428,7 +430,7 @@ module Sidekiq::CloudWatchMetrics
 
     # Reduces { class => buckets } to at most @max_job_classes entries by
     # keeping the busiest classes (sum of bucket counts) and combining the
-    # rest element-wise into a single "Other" histogram.
+    # rest element-wise into a single `(other)` histogram.
     private def cap_job_class_cardinality(histograms)
       return histograms if @max_job_classes.nil? || histograms.size <= @max_job_classes
 

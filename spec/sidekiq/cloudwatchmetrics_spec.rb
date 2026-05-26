@@ -814,16 +814,15 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
             )
           end
 
-          it "keeps the busiest classes and rolls the rest into an Other series" do
+          it "keeps the busiest classes and rolls the rest into an (other) series" do
             publisher.publish
 
-            published = client.instance_variable_get(:@put_metric_data_call) || nil
             expect(client).to have_received(:put_metric_data) do |args|
               job_classes = args[:metric_data].map { |m| m[:dimensions].first[:value] }
-              expect(job_classes).to contain_exactly("BusiestJob", "MidJob", "Other")
+              expect(job_classes).to contain_exactly("BusiestJob", "MidJob", "(other)")
 
-              other = args[:metric_data].find { |m| m[:dimensions].first[:value] == "Other" }
-              # RareJobA (sum=3) + RareJobB (sum=3) → Other sum = 6
+              other = args[:metric_data].find { |m| m[:dimensions].first[:value] == "(other)" }
+              # RareJobA (sum=3) + RareJobB (sum=3) → (other) sum = 6
               expect(other[:value]).to eq(6.0)
             end
           end
@@ -835,7 +834,7 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
               )
             end
 
-            it "publishes one series per class with no Other bucket" do
+            it "publishes one series per class with no rollup bucket" do
               publisher.publish
 
               expect(client).to have_received(:put_metric_data) do |args|
@@ -852,12 +851,12 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
               )
             end
 
-            it "publishes one series per class with no Other bucket" do
+            it "publishes one series per class with no rollup bucket" do
               publisher.publish
 
               expect(client).to have_received(:put_metric_data) do |args|
                 job_classes = args[:metric_data].map { |m| m[:dimensions].first[:value] }
-                expect(job_classes).not_to include("Other")
+                expect(job_classes).not_to include("(other)")
                 expect(job_classes.size).to eq(job_buckets.size)
               end
             end

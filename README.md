@@ -176,8 +176,9 @@ a lot of noise that rarely informs an operator decision.
 By default the publisher caps `JobClass` cardinality at **20**: the 20
 classes with the most samples in the last minute keep their own
 series, and everything else is summed bucket-by-bucket into a single
-`JobClass=Other` histogram. Operators still see overall long-tail
-latency without paying per-class for the long tail.
+`JobClass=(other)` histogram. The parentheses make the rollup label
+distinct from any real Ruby class name. Operators still see overall
+long-tail latency without paying per-class for the long tail.
 
 ```ruby
 Sidekiq::CloudWatchMetrics.enable!(
