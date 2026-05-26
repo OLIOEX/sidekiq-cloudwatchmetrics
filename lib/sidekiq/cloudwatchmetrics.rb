@@ -350,7 +350,13 @@ module Sidekiq::CloudWatchMetrics
       when nil, false
         nil
       when :redis
-        RedisLeader.new(key: "sidekiq-cloudwatchmetrics:leader:#{@namespace}", interval: @interval_s)
+        # Interval is part of the key so multiple publishers on the same
+        # namespace (e.g. a 60s publisher + a 10s burst publisher) elect
+        # leaders independently rather than fighting over one Redis key.
+        RedisLeader.new(
+          key: "sidekiq-cloudwatchmetrics:leader:#{@namespace}:#{@interval_s}s",
+          interval: @interval_s,
+        )
       else
         # Accept any object that quacks like a leader so callers can plug in
         # their own elector (a different backend, a test double, etc.).

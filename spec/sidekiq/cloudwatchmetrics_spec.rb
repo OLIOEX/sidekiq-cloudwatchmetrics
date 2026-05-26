@@ -831,15 +831,32 @@ RSpec.describe Sidekiq::CloudWatchMetrics do
         end
 
         context "with leader_election: :redis" do
-          it "builds a RedisLeader scoped by namespace" do
+          it "builds a RedisLeader scoped by namespace and interval" do
             expect(Sidekiq::CloudWatchMetrics::RedisLeader).to receive(:new).with(
-              key: "sidekiq-cloudwatchmetrics:leader:my-ns",
+              key: "sidekiq-cloudwatchmetrics:leader:my-ns:60s",
               interval: 60,
             ).and_return(leader)
 
             Sidekiq::CloudWatchMetrics::Publisher.new(
               client: client, namespace: "my-ns", leader_election: :redis,
             )
+          end
+
+          it "uses distinct keys for publishers on the same namespace with different intervals" do
+            keys = []
+            allow(Sidekiq::CloudWatchMetrics::RedisLeader).to receive(:new) { |args| keys << args[:key]; leader }
+
+            Sidekiq::CloudWatchMetrics::Publisher.new(
+              client: client, namespace: "my-ns", interval: 60, leader_election: :redis,
+            )
+            Sidekiq::CloudWatchMetrics::Publisher.new(
+              client: client, namespace: "my-ns", interval: 10, leader_election: :redis,
+            )
+
+            expect(keys).to eq([
+              "sidekiq-cloudwatchmetrics:leader:my-ns:60s",
+              "sidekiq-cloudwatchmetrics:leader:my-ns:10s",
+            ])
           end
         end
 
