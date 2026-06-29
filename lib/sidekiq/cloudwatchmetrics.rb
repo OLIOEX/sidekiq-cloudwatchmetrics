@@ -58,9 +58,126 @@ module Sidekiq::CloudWatchMetrics
     end
   end
 
+  # Records and reads per-job-class execution durations in short-lived Redis
+  # lists, keyed by (namespace, UTC minute, job class). The Publisher drains a
+  # completed minute and computes true percentile latencies from the raw
+  # samples — unlike Sidekiq's own execution histogram, which buckets durations
+  # and collapses everything slower than ~335s into a single "Slow" bucket.
+  class ExecutionSamples
+    # Sample lists and the per-minute class index expire this long after their
+    # last write — a backstop in case the leader misses a drain tick. Safely
+    # longer than the 60s publish cadence.
+    TTL_SECONDS = 180
+
+    # Most samples retained per class per minute. Percentiles stay accurate far
+    # below this; the cap only bounds Redis memory for pathological bursts. We
+    # keep the most recent samples (LTRIM to the tail).
+    DEFAULT_SAMPLE_CAP = 5_000
+
+    def initialize(namespace:, sample_cap: DEFAULT_SAMPLE_CAP)
+      @prefix = "sidekiq-cloudwatchmetrics:exectimes:#{namespace}"
+      @sample_cap = sample_cap
+    end
+
+    # Append one execution time (milliseconds) to the current minute's list for
+    # `klass` and register the class in that minute's index. Best-effort: any
+    # Redis error is swallowed so recording never disturbs the job being run.
+    def record(klass, elapsed_ms, now = Time.now)
+      window = window_key(now)
+      list = list_key(window, klass)
+      index = index_key(window)
+
+      Sidekiq.redis do |conn|
+        conn.rpush(list, elapsed_ms.round(3))
+        conn.ltrim(list, -@sample_cap, -1)
+        conn.expire(list, TTL_SECONDS)
+        conn.sadd(index, klass)
+        conn.expire(index, TTL_SECONDS)
+      end
+      nil
+    rescue => e
+      Sidekiq.logger.debug { "[sidekiq-cloudwatchmetrics] failed to record execution time: #{e}" } if Sidekiq.respond_to?(:logger)
+      nil
+    end
+
+    # Returns { klass => [ms, ...] } for the minute containing `time`, deleting
+    # the drained keys so a re-run (or a second leader after failover) sees
+    # nothing rather than double-publishing.
+    def drain(time)
+      window = window_key(time)
+      index = index_key(window)
+      samples = {}
+
+      Sidekiq.redis do |conn|
+        classes = conn.smembers(index)
+        return {} if classes.nil? || classes.empty?
+
+        classes.each do |klass|
+          list = list_key(window, klass)
+          values = conn.lrange(list, 0, -1)
+          conn.del(list)
+          next if values.nil? || values.empty?
+          samples[klass] = values.map(&:to_f)
+        end
+        conn.del(index)
+      end
+
+      samples
+    end
+
+    private def window_key(time)
+      time.utc.strftime("%Y%m%dT%H%M")
+    end
+
+    private def list_key(window, klass)
+      "#{@prefix}:#{window}:samples:#{klass}"
+    end
+
+    private def index_key(window)
+      "#{@prefix}:#{window}:classes"
+    end
+  end
+
+  # Sidekiq server middleware that records how long each job ran, so the
+  # Publisher can report true per-class percentile latencies. Only executions
+  # at or above `min_job_seconds` are stored — the same threshold the Publisher
+  # uses to decide which classes are worth a billable CloudWatch metric — so
+  # fast jobs cost nothing beyond a monotonic clock read. A nil threshold
+  # records every execution.
+  class ExecutionRecorder
+    def initialize(namespace, min_job_seconds, sample_cap = ExecutionSamples::DEFAULT_SAMPLE_CAP)
+      @samples = ExecutionSamples.new(namespace: namespace, sample_cap: sample_cap)
+      @min_job_ms = min_job_seconds.nil? ? 0.0 : Float(min_job_seconds) * 1000.0
+    end
+
+    def call(_worker, job, _queue)
+      started = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+      yield
+    ensure
+      elapsed_ms = (::Process.clock_gettime(::Process::CLOCK_MONOTONIC) - started) * 1000.0
+      if elapsed_ms >= @min_job_ms
+        klass = job["wrapped"] || job["class"]
+        @samples.record(klass, elapsed_ms) if klass
+      end
+    end
+  end
+
   def self.enable!(**kwargs)
     Sidekiq.configure_server do |config|
       publisher = Publisher.new(config: config, **kwargs)
+
+      # Per-job-class execution-time percentiles are computed from real
+      # durations we record ourselves (see ExecutionRecorder), so install the
+      # recording middleware whenever this publisher owns those metrics. The
+      # guard keeps it a no-op when enable! is called more than once — e.g. a
+      # 60s metrics publisher plus a fast queue-only publisher.
+      if publisher.records_execution_times?
+        config.server_middleware do |chain|
+          unless chain.exists?(ExecutionRecorder)
+            chain.add(ExecutionRecorder, publisher.namespace, publisher.min_job_seconds, publisher.execution_sample_cap)
+          end
+        end
+      end
 
       # Sidekiq enterprise has a globally unique leader thread, making it
       # easier to publish the cluster-wide metrics from one place.
@@ -116,26 +233,31 @@ module Sidekiq::CloudWatchMetrics
     PROCESS_METRICS = %i[process_utilization].freeze
     QUEUE_METRICS = %i[queue_size queue_latency].freeze
 
-    # Per-job-class execution time percentiles, derived from the histogram data
-    # Sidekiq 7+ records in Redis via Sidekiq::Metrics::ExecutionTracker.
-    EXECUTION_HISTOGRAM_METRICS = %i[
+    # Per-job-class execution time percentiles, computed from the real job
+    # durations ExecutionRecorder records into Redis. Reporting true seconds
+    # (no histogram bucketing) means slow jobs are no longer clamped to ~335s.
+    EXECUTION_TIME_METRICS = %i[
       job_execution_time_p50
       job_execution_time_p95
       job_execution_time_p99
     ].freeze
 
-    EXECUTION_HISTOGRAM_PERCENTILES = {
+    EXECUTION_TIME_PERCENTILES = {
       job_execution_time_p50: [0.50, "JobExecutionTimeP50"],
       job_execution_time_p95: [0.95, "JobExecutionTimeP95"],
       job_execution_time_p99: [0.99, "JobExecutionTimeP99"],
     }.freeze
 
+    # Drain the minute that finished one window ago, so we never read a window
+    # that jobs are still completing into.
+    EXECUTION_WINDOW_SECONDS = 60
+
     # Each distinct JobClass dimension value is a separate CloudWatch billable
     # metric; long-tail apps with hundreds of job classes pay for noise on jobs
-    # that complete in milliseconds. Only classes with at least one execution
-    # exceeding this threshold (in seconds) publish per-class percentile series.
-    # Fast jobs are dropped entirely — the global publisher-level metrics still
-    # cover overall throughput.
+    # that complete in milliseconds. ExecutionRecorder only records (and we only
+    # publish) executions at or above this threshold (in seconds), so fast jobs
+    # cost nothing — the global publisher-level metrics still cover overall
+    # throughput. Set to nil to record and publish every execution.
     DEFAULT_MIN_JOB_SECONDS = 0.5
 
     ALL_METRICS = (
@@ -144,7 +266,7 @@ module Sidekiq::CloudWatchMetrics
       TAG_METRICS +
       PROCESS_METRICS +
       QUEUE_METRICS +
-      EXECUTION_HISTOGRAM_METRICS
+      EXECUTION_TIME_METRICS
     ).freeze
 
     private def default_config
@@ -157,7 +279,7 @@ module Sidekiq::CloudWatchMetrics
       end
     end
 
-    def initialize(config: default_config, client: Aws::CloudWatch::Client.new, namespace: "Sidekiq", process_metrics: nil, additional_dimensions: {}, interval: DEFAULT_INTERVAL, metrics: nil, leader_election: nil, min_job_seconds: DEFAULT_MIN_JOB_SECONDS)
+    def initialize(config: default_config, client: Aws::CloudWatch::Client.new, namespace: "Sidekiq", process_metrics: nil, additional_dimensions: {}, interval: DEFAULT_INTERVAL, metrics: nil, leader_election: nil, min_job_seconds: DEFAULT_MIN_JOB_SECONDS, sample_cap: ExecutionSamples::DEFAULT_SAMPLE_CAP, execution_samples: nil)
       # Required by Sidekiq::Component (in sidekiq 6.5+)
       @config = config
 
@@ -169,6 +291,17 @@ module Sidekiq::CloudWatchMetrics
       @enabled_metrics = resolve_enabled_metrics(metrics, process_metrics)
       @leader = build_leader(leader_election)
       @min_job_seconds = resolve_min_job_seconds(min_job_seconds)
+      @execution_sample_cap = sample_cap
+      @execution_samples = execution_samples || ExecutionSamples.new(namespace: @namespace, sample_cap: @execution_sample_cap)
+    end
+
+    # Exposed so enable! can configure a matching ExecutionRecorder middleware.
+    attr_reader :namespace, :min_job_seconds, :execution_sample_cap
+
+    # True when this publisher owns any per-job execution-time percentile, i.e.
+    # when the duration-recording middleware needs to run.
+    def records_execution_times?
+      enabled_any?(EXECUTION_TIME_METRICS)
     end
 
     def start
@@ -294,13 +427,14 @@ module Sidekiq::CloudWatchMetrics
         end
       end
 
-      if enabled_any?(EXECUTION_HISTOGRAM_METRICS) && execution_histograms_supported?
-        fetch_recent_execution_histograms.each do |klass, buckets|
+      if records_execution_times?
+        @execution_samples.drain(now - EXECUTION_WINDOW_SECONDS).each do |klass, durations_ms|
+          next if durations_ms.empty?
           job_dimensions = [{name: "JobClass", value: klass}]
-          EXECUTION_HISTOGRAM_METRICS.each do |key|
+          EXECUTION_TIME_METRICS.each do |key|
             next unless enabled?(key)
-            percentile, metric_name = EXECUTION_HISTOGRAM_PERCENTILES.fetch(key)
-            seconds = percentile_seconds(buckets, percentile)
+            percentile, metric_name = EXECUTION_TIME_PERCENTILES.fetch(key)
+            seconds = percentile_seconds(durations_ms, percentile)
             next if seconds.nil?
             metrics << build_metric(metric_name, seconds, now, unit: "Seconds", dimensions: job_dimensions)
           end
@@ -397,50 +531,6 @@ module Sidekiq::CloudWatchMetrics
       enabled
     end
 
-    # Sidekiq 7 introduced the in-process ExecutionTracker, which records
-    # per-class execution time histograms in Redis. The publisher reads those
-    # histograms (not raw timings) so each tick is cheap regardless of throughput.
-    private def execution_histograms_supported?
-      defined?(Sidekiq::Metrics::Query) && defined?(Sidekiq::Metrics::Histogram)
-    end
-
-    # The ExecutionTracker flushes to Redis on each Sidekiq heartbeat (~10s),
-    # so we query the previous full minute to avoid racing an in-progress flush.
-    # Returns { class_name => [bucket_count, ...] } for classes that had at
-    # least one execution exceeding @min_job_seconds (when set). Fast jobs are
-    # dropped so they don't pay CloudWatch's per-metric cost.
-    private def fetch_recent_execution_histograms
-      query_time = Time.now - 60
-      query = Sidekiq::Metrics::Query.new(now: query_time)
-      result = query.top_jobs(minutes: 1)
-      return {} if result.job_results.empty?
-
-      histograms = {}
-      Sidekiq.redis do |conn|
-        result.job_results.each_key do |klass|
-          buckets = Sidekiq::Metrics::Histogram.new(klass).fetch(conn, query_time)
-          next if buckets.nil? || buckets.sum.zero?
-          next unless slow_enough?(buckets)
-          histograms[klass] = buckets
-        end
-      end
-      histograms
-    end
-
-    # A histogram is "slow enough" if any sample landed in a bucket whose upper
-    # bound exceeds @min_job_seconds — i.e. at least one execution took longer
-    # than the threshold. When @min_job_seconds is nil/non-positive the filter
-    # is disabled and every class with activity publishes.
-    private def slow_enough?(buckets)
-      return true if @min_job_seconds.nil?
-
-      threshold_ms = @min_job_seconds * 1000.0
-      intervals = Sidekiq::Metrics::Histogram::BUCKET_INTERVALS
-      slow_start = intervals.find_index { |upper| upper > threshold_ms }
-      return false unless slow_start
-      buckets[slow_start..].any? { |count| count.positive? }
-    end
-
     private def resolve_min_job_seconds(value)
       return nil if value.nil?
       float_value = Float(value)
@@ -448,26 +538,18 @@ module Sidekiq::CloudWatchMetrics
       float_value
     end
 
-    # Computes a percentile from Sidekiq's 26-bucket execution histogram.
-    # Each bucket's upper bound comes from Sidekiq::Metrics::Histogram::BUCKET_INTERVALS;
-    # we report that upper bound (a conservative over-estimate). The final
-    # "Slow" bucket has an effectively infinite upper bound, so we clamp it to
-    # the previous bucket's upper bound to keep the published value plottable.
-    private def percentile_seconds(buckets, percentile)
-      total = buckets.sum
-      return nil if total.zero?
+    # Nearest-rank percentile (in seconds) over a class's raw execution
+    # durations (milliseconds) for the drained minute. There is no ceiling:
+    # a job that ran 600s reports 600.0, where the old histogram path clamped
+    # everything past its top bucket to 335s.
+    private def percentile_seconds(durations_ms, percentile)
+      return nil if durations_ms.empty?
 
-      intervals = Sidekiq::Metrics::Histogram::BUCKET_INTERVALS
-      last_index = intervals.size - 1
-      target = total * percentile
-      cumulative = 0
-      buckets.each_with_index do |count, idx|
-        cumulative += count
-        next if cumulative < target
-        upper_ms = (idx == last_index) ? intervals[last_index - 1] : intervals[idx]
-        return upper_ms / 1000.0
-      end
-      nil
+      sorted = durations_ms.sort
+      rank = (percentile * sorted.length).ceil
+      rank = 1 if rank < 1
+      rank = sorted.length if rank > sorted.length
+      (sorted[rank - 1] / 1000.0).round(3)
     end
 
     # Returns the total number of workers across all processes

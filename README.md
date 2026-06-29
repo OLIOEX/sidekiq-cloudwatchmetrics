@@ -105,21 +105,26 @@ Available metric keys:
 | `:process_utilization`  | `Utilization`         | per process (Hostname dimension)       |
 | `:queue_size`           | `QueueSize`           | per queue                              |
 | `:queue_latency`        | `QueueLatency`        | per queue                              |
-| `:job_execution_time_p50` | `JobExecutionTimeP50` | per job class (Sidekiq 7+)           |
-| `:job_execution_time_p95` | `JobExecutionTimeP95` | per job class (Sidekiq 7+)           |
-| `:job_execution_time_p99` | `JobExecutionTimeP99` | per job class (Sidekiq 7+)           |
+| `:job_execution_time_p50` | `JobExecutionTimeP50` | per job class                        |
+| `:job_execution_time_p95` | `JobExecutionTimeP95` | per job class                        |
+| `:job_execution_time_p99` | `JobExecutionTimeP99` | per job class                        |
 
 Unknown symbols raise `ArgumentError` at boot.
 
-The `job_execution_time_*` metrics are derived from the execution histograms
-Sidekiq 7+ records in Redis via its built-in `ExecutionTracker` middleware.
-Each tick reads the previous full minute's histograms once and computes the
-requested percentiles from the bucket counts (resolution is whichever
-`Sidekiq::Metrics::Histogram::BUCKET_INTERVALS` bucket the percentile falls
-into — e.g. `1.7s`, `2.5s`, `3.8s`). They are silently skipped on Sidekiq
-versions that don't ship `Sidekiq::Metrics`. Use them on the standard 60s
-publisher, not on burst publishers — the source data only updates once per
-minute.
+The `job_execution_time_*` metrics report **true percentile latencies in
+seconds**, computed from the actual durations a small server middleware
+(`ExecutionRecorder`) records as each job runs. Recording uses a monotonic
+clock and writes one short-lived, per-minute Redis list per job class; the
+standard publisher drains the previous full minute on each tick, computes the
+requested percentiles, and publishes them.
+
+Earlier versions derived these from Sidekiq's built-in execution histogram,
+whose buckets top out at a `≥335s` "Slow" bucket — so any job slower than that
+was reported as exactly `335`. Recording real durations removes that ceiling: a
+job that ran 600s now reports `600.0`. Because recording is done by our own
+middleware, the metrics no longer require `Sidekiq::Metrics` and work on every
+supported Sidekiq version. Enable them on the standard 60s publisher, not on
+burst publishers — a window is drained once per minute.
 
 The legacy `process_metrics:` boolean is still accepted for backwards
 compatibility but emits a deprecation warning — prefer the `metrics:` option
@@ -171,27 +176,28 @@ Sidekiq::CloudWatchMetrics.enable!(
 `job_execution_time_p*` metrics publish one CloudWatch series per
 distinct Sidekiq job class, and every series is a separate billable
 custom metric. In a typical app most jobs complete in tens of
-milliseconds — the per-class percentiles of those jobs land in the
-first histogram bucket and rarely inform an operator decision, but
-they each cost the same per-metric fee.
+milliseconds — the per-class percentiles of those jobs rarely inform an
+operator decision, but they each cost the same per-metric fee.
 
-By default the publisher skips any class that didn't have at least one
-execution slower than **0.5 seconds** in the last minute. Slow jobs —
-the ones operators actually care about — still get their own series.
-Fast jobs are dropped entirely; their throughput shows up in the
-global `ProcessedJobs` / `Workers` metrics.
+`min_job_seconds` is the single seconds threshold that governs this. The
+recorder only stores an execution whose duration is **at or above** it, so
+fast jobs cost nothing beyond a monotonic clock read and never create a
+CloudWatch series. It defaults to **0.5 seconds**; the reported percentiles
+are therefore percentiles over the *slow* runs of each class — exactly what a
+"top slow jobs" view wants.
 
 ```ruby
 Sidekiq::CloudWatchMetrics.enable!(
   metrics: %i[job_execution_time_p50 job_execution_time_p99],
-  min_job_seconds: 0.5,  # default
+  min_job_seconds: 0.5,  # default — the recording / publishing threshold, in seconds
 )
 ```
 
-Pass `min_job_seconds: nil` (or `0`) to publish every class with any
-activity, or any positive number to tune the threshold. The filter
-operates on Sidekiq's histogram buckets, so a class qualifies if any
-sample landed in a bucket whose upper bound exceeds the threshold.
+Pass `min_job_seconds: nil` (or `0`) to record and publish every execution
+(true percentiles over *all* runs), or any positive number to tune the
+threshold. Per-class Redis lists are capped at `sample_cap:` samples per minute
+(default `5000`) purely to bound memory under bursts; percentiles stay accurate
+well below the cap.
 
 ## Development
 
